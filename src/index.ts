@@ -1,70 +1,97 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { register } from "microsoft-graph/services/context";
-import { getEnvironmentVariable } from "microsoft-graph/services/environmentVariable";
-import { TenantId } from "microsoft-graph/models/TenantId";
-import { ClientId } from "microsoft-graph/models/ClientId";
-import { SiteId } from "microsoft-graph/models/SiteId";
-import { ClientSecret } from "microsoft-graph/models/ClientSecret";
+import { Client } from "@microsoft/microsoft-graph-client";
+import { ConfidentialClientApplication } from "@azure/msal-node";
 import dotenv from "dotenv";
-
-import { createDriveRef } from "microsoft-graph/services/drive";
-import { createSiteRef } from "microsoft-graph/services/site";
-import { DriveId } from "microsoft-graph/models/DriveId";
-import listDriveItems from "microsoft-graph/operations/driveItem/listDriveItems";
-import { createDriveItemRef } from "microsoft-graph/services/driveItem";
-import { DriveItemId } from "microsoft-graph/models/DriveItemId";
-import getDriveItem from "microsoft-graph/operations/driveItem/getDriveItem";
-import listSites from "microsoft-graph/operations/site/listSites";
 dotenv.config();
 
 // Initialize the MCP server and SharePoint connector
 async function createSharepointMcpServer() {
   
-  const tenantId = getEnvironmentVariable("TENANT_ID") as TenantId;
-  const clientId = getEnvironmentVariable("CLIENT_ID") as ClientId;
-  const clientSecret = getEnvironmentVariable("CLIENT_SECRET") as ClientSecret;
+  const tenantId = process.env.TENANT_ID;
+  const clientId = process.env.CLIENT_ID;
+  const clientSecret = process.env.CLIENT_SECRET;
+  const driveId = process.env.DRIVE_ID;
+  const siteId = process.env.SITE_ID;
 
-  const driveId = getEnvironmentVariable("DRIVE_ID") as DriveId;
-  const siteId = getEnvironmentVariable("SITE_ID") as SiteId;
+  if (!tenantId || !clientId || !clientSecret) {
+    throw new Error("Missing required environment variables: TENANT_ID, CLIENT_ID, CLIENT_SECRET");
+  }
+
   // Create the server
   const server = new McpServer({
     name: "SharePoint Server",
     version: "1.0.0"
   });
 
-  const contextRef = register(tenantId, clientId, clientSecret);
-  const siteRef = createSiteRef(contextRef, siteId);
-  const driveRef = createDriveRef(siteRef, driveId);
+  // Initialize Microsoft Graph client
+  const clientApp = new ConfidentialClientApplication({
+    auth: {
+      clientId,
+      clientSecret,
+      authority: `https://login.microsoftonline.com/${tenantId}`
+    }
+  });
+
+  const graphClient = Client.initWithMiddleware({
+    authProvider: {
+      getAccessToken: async () => {
+        const clientCredentialRequest = {
+          scopes: ['https://graph.microsoft.com/.default'],
+        };
+        const response = await clientApp.acquireTokenByClientCredential(clientCredentialRequest);
+        return response?.accessToken || '';
+      }
+    }
+  });
 
   // Resource: Folder contents (root or specific folder)
   server.resource(
     "folder",
     new ResourceTemplate("sharepoint://folder/{folderId?}", { list: undefined }),
     async (uri) => {
-      const items = await listDriveItems(driveRef);
-      return {
-        contents: [{
-          uri: uri.href,
-          text: JSON.stringify(items, null, 2)
-        }]
-      };
+      try {
+        const driveUrl = siteId ? `/sites/${siteId}/drive` : '/me/drive';
+        const items = await graphClient.api(`${driveUrl}/root/children`).get();
+        return {
+          contents: [{
+            uri: uri.href,
+            text: JSON.stringify(items, null, 2)
+          }]
+        };
+      } catch (error) {
+        return {
+          contents: [{
+            uri: uri.href,
+            text: `Error fetching folder contents: ${error}`
+          }]
+        };
+      }
     }
   );
 
-  // Resource: Sites 
+  // Resource: Sites
   server.resource(
     "sites",
     "sharepoint://sites",
     async (uri) => {
-      const items = await listSites(contextRef);
-      return {
-        contents: [{
-          uri: uri.href,
-          text: JSON.stringify(items, null, 2)
-        }]
-      };
+      try {
+        const sites = await graphClient.api('/sites').get();
+        return {
+          contents: [{
+            uri: uri.href,
+            text: JSON.stringify(sites, null, 2)
+          }]
+        };
+      } catch (error) {
+        return {
+          contents: [{
+            uri: uri.href,
+            text: `Error fetching sites: ${error}`
+          }]
+        };
+      }
     }
   );
 
@@ -73,18 +100,24 @@ async function createSharepointMcpServer() {
     "document",
     new ResourceTemplate("sharepoint://document/{documentId}", { list: undefined }),
     async (uri, { documentId }) => {
-      const driveItemRef = createDriveItemRef(driveRef, documentId as DriveItemId);
-      const result = await getDriveItem(driveItemRef);
-      return {
-        contents: [{
-          uri: uri.href,
-          text: result.content
-            ? (typeof result.content === 'string'
-                ? result.content
-                : JSON.stringify(result.content, null, 2))
-            : "No content available" // Fallback value
-        }]
-      };
+      try {
+        const driveUrl = siteId ? `/sites/${siteId}/drive` : '/me/drive';
+        const item = await graphClient.api(`${driveUrl}/items/${documentId}`).get();
+        const content = await graphClient.api(`${driveUrl}/items/${documentId}/content`).get();
+        return {
+          contents: [{
+            uri: uri.href,
+            text: content || JSON.stringify(item, null, 2)
+          }]
+        };
+      } catch (error) {
+        return {
+          contents: [{
+            uri: uri.href,
+            text: `Error fetching document: ${error}`
+          }]
+        };
+      }
     }
   );
 
@@ -95,15 +128,17 @@ async function createSharepointMcpServer() {
       query: z.string().describe("Search query to find documents"),
       maxResults: z.string().optional().describe("Maximum number of results to return (as a string)")
     },
-    async ({ query, maxResults = 10 }) => {
+    async ({ query, maxResults = "10" }) => {
       try {
-        const driveRef = createDriveRef(siteRef, driveId);
-        const driveItems = await listDriveItems(driveRef);
-        const results = driveItems.filter((item: any) => item.name.includes(query)).slice(0, parseInt(maxResults.toString(), 10));
+        const driveUrl = siteId ? `/sites/${siteId}/drive` : '/me/drive';
+        const driveItems = await graphClient.api(`${driveUrl}/root/children`).get();
+        const results = driveItems.value.filter((item: any) =>
+          item.name && item.name.toLowerCase().includes(query.toLowerCase())
+        ).slice(0, parseInt(maxResults.toString(), 10));
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(results, null, 2) // Ensure this is a valid string
+            text: JSON.stringify(results, null, 2)
           }]
         };
       } catch (error) {
@@ -126,16 +161,13 @@ async function createSharepointMcpServer() {
     },
     async ({ documentId }) => {
       try {
-        const driveItemRef = createDriveItemRef(driveRef, documentId as DriveItemId);
-        const result = await getDriveItem(driveItemRef);
+        const driveUrl = siteId ? `/sites/${siteId}/drive` : '/me/drive';
+        const item = await graphClient.api(`${driveUrl}/items/${documentId}`).get();
+        const content = await graphClient.api(`${driveUrl}/items/${documentId}/content`).get();
         return {
           content: [{
             type: "text",
-            text: result.content
-              ? (typeof result.content === 'string'
-                  ? result.content
-                  : JSON.stringify(result.content, null, 2))
-              : "No content available" // Fallback value
+            text: content || JSON.stringify(item, null, 2)
           }]
         };
       } catch (error) {
